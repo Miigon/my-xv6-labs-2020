@@ -697,3 +697,16 @@ procdump(void)
     printf("\n");
   }
 }
+
+uint64
+count_process(void) { // added function for counting used process slots (lab2)
+  uint64 cnt = 0;
+  for(struct proc *p = proc; p < &proc[NPROC]; p++) {
+    // acquire(&p->lock);
+    // no need to lock since all we do is reading, no writing will be done to the proc.
+    if(p->state != UNUSED) {
+      cnt++;
+    }
+  }
+  return cnt;
+}
