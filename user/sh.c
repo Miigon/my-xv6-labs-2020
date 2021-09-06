@@ -3,6 +3,8 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/stat.h"
+#include "kernel/fs.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -130,22 +132,144 @@ runcmd(struct cmd *cmd)
   exit(0);
 }
 
+int script_fd = -1; // added by miigon as challenge for lab1
+
+int is_valid_identifier_char(char c) { // used in tab completion
+  return  (c >= 'A' && c <= 'Z') ||
+          (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') ||
+          c == '_' || c == '.' || c == '-';
+}
+
+char *find_last_word(char *buf) {
+  char *word = buf + strlen(buf) - 1;
+  while(is_valid_identifier_char(*word) && word != buf-1) {
+    word--;
+  }
+  word++;
+  return word;
+}
+
+int tab_completion(char *cmdbuf) {
+  char *last_word = find_last_word(cmdbuf);
+  // printf("\ntrying tab:%s\n", word);
+
+  // copied from find.c
+	char buf[512], *p;
+	int fd;
+	struct dirent de;
+	struct stat st;
+
+  const char* path = ".";
+	if((fd = open(path, 0)) < 0){
+		fprintf(2, "auto-complete: cannot open %s\n", path);
+		return 0;
+	}
+
+	if(fstat(fd, &st) < 0){
+		fprintf(2, "auto-complete: cannot stat %s\n", path);
+		close(fd);
+		return 0;
+	}
+  
+  int added_length = 0;
+	switch(st.type){
+	case T_DIR:
+		// printf("%s\n", path);
+		if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+			printf("auto-complete: path too long\n");
+			break;
+		}
+		strcpy(buf, path);
+		p = buf+strlen(buf);
+		*p++ = '/';
+		while(read(fd, &de, sizeof(de)) == sizeof(de)){
+			if(de.inum == 0)
+				continue;
+			memmove(p, de.name, DIRSIZ);
+			p[DIRSIZ] = 0;
+			if(stat(buf, &st) < 0){
+				printf("auto-complete: cannot stat %s\n", buf);
+				continue;
+			}
+	//   printf("%s\n", buf);
+			if(strcmp(buf+strlen(buf)-2, "/.") != 0 && strcmp(buf+strlen(buf)-3, "/..") != 0) {
+				char *last_word_from_buf = find_last_word(buf);
+        if(memcmp(last_word_from_buf, last_word, strlen(last_word)) == 0) {
+          printf("auto-completed: %s\n\n", last_word_from_buf);
+          added_length = strlen(last_word_from_buf) - strlen(last_word);
+          strcpy(last_word, last_word_from_buf);
+          break;
+        }
+			}
+		}
+		break;
+	}
+	close(fd);
+  return added_length;
+}
+
 int
-getcmd(char *buf, int nbuf)
+get_oneline_of_cmd(char *buf, int nbuf)
 {
-  fprintf(2, "$ ");
+  if(script_fd == -1) {
+    fprintf(2, "$ ");
+  }
   memset(buf, 0, nbuf);
-  gets(buf, nbuf);
+
+  // copied & modified from gets() in ulib.c
+  int i, cc;
+  char c;
+
+  for(i=0; i+1 < nbuf; ){
+    if(script_fd == -1) {
+      cc = read(0, &c, 1);
+    } else {
+      cc = read(script_fd, &c, 1);
+    }
+    if(cc < 1)
+      break;
+    if(c == '\t') { // added tab completion
+      i += tab_completion(buf);
+    } else {
+      buf[i++] = c;
+      if(c == '\n' || c == '\r')
+        break;
+    }
+  }
+  buf[i] = '\0';
+
   if(buf[0] == 0) // EOF
     return -1;
   return 0;
 }
 
+void process_one_cmd(char *buf) {
+  if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+      // Chdir must be called by the parent, not the child.
+      buf[strlen(buf)-1] = 0;  // chop \n
+      if(chdir(buf+3) < 0)
+        fprintf(2, "cannot cd %s\n", buf+3);
+      return;
+    }
+    if(memcmp(buf, "wait ", 5) == 0) {
+      sleep(atoi(buf+5));
+      return;
+    }
+    if(fork1() == 0)
+      runcmd(parsecmd(buf));
+    wait(0);
+}
+
 int
-main(void)
+main(int argc, char **argv)
 {
   static char buf[100];
   int fd;
+
+  if(argc >= 2) { // miigon: added support for running script from a file
+    script_fd = open(argv[1], O_RDWR);
+  }
 
   // Ensure that three file descriptors are open.
   while((fd = open("console", O_RDWR)) >= 0){
@@ -156,17 +280,17 @@ main(void)
   }
 
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
-    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
-      // Chdir must be called by the parent, not the child.
-      buf[strlen(buf)-1] = 0;  // chop \n
-      if(chdir(buf+3) < 0)
-        fprintf(2, "cannot cd %s\n", buf+3);
-      continue;
+  while(get_oneline_of_cmd(buf, sizeof(buf)) >= 0){
+    char *cmdstart = buf; char *p = buf;
+    while(*p != '\0') {
+      if(*p == ';') {
+        *p = '\0';
+        process_one_cmd(cmdstart);
+        cmdstart = p+1;
+      }
+      p++;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
+    process_one_cmd(cmdstart);
   }
   exit(0);
 }
