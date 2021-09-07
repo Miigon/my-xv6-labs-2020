@@ -13,6 +13,7 @@ void sieve(int pleft[2]) {
 	int pright[2];
 	pipe(pright);
 	if(fork() == 0) { // child
+		close(pleft[0]);
 		close(pright[1]); // close unnecessary fd (every forked process has a copy of the fd, so it's important to reduce the amount of it)
 		sieve(pright);	
 	} else { // parent
