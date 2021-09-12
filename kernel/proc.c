@@ -30,17 +30,11 @@ procinit(void)
   initlock(&pid_lock, "nextpid");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
-
-      // Allocate a page for the process's kernel stack.
-      // Map it high in memory, followed by an invalid
-      // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      // note for blog: 内核页表本来是只有一个的，所有进程共用，所以需要为不同进程创建多个内核栈，并 map 到不同位置
+      // lab3exp2 中，添加了为每个进程创建单独的内核页表的设计，所以可以每个页表只分配一个内核栈并 map 到固定位置。
+      // （同个页表不同位置 -> 不同页表同一位置）
   }
+
   kvminithart();
 }
 
@@ -121,6 +115,21 @@ found:
     return 0;
   }
 
+  // Make a new kernel pagetable for the new process
+  p->kernelpgtbl = kvminit_newpgtbl();
+  // printf("kernel_pagetable: %p\n", p->kernelpgtbl);
+
+  // Allocate a page for the process's kernel stack.
+  // Map it high in memory, followed by an invalid
+  // guard page.
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = KSTACK((int)0); // fixed location for kstack position
+  // printf("map krnlstack va: %p to pa: %p\n", va, pa);
+  kvmmap(p->kernelpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -149,6 +158,22 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  
+  // free process-specific kernel stack
+  void *kstack_pa = (void *)kvmpa(p->kernelpgtbl, p->kstack);
+  // printf("trace: free kstack %p\n", kstack_pa);
+  kfree(kstack_pa);
+  p->kstack = 0;
+  
+  // proc_freepagetable can not be used here, since it not only frees the pagetable itself, 
+  // but also frees all the leaf pages within the pagetable, which in this case are critical
+  // pages for the kernel's function. kfree() only frees the pagetable itself.
+  // edit: using only kfree(p->kernelpgtbl) here will lead to memory leak since
+  // PTEs inside the kernel page table were allocated using kalloc and not freed.
+  
+  // printf("trace: freepgtbl %p\n",p->kernelpgtbl);
+  kvm_free_kernelpgtbl(p->kernelpgtbl);
+  p->kernelpgtbl = 0;
   p->state = UNUSED;
 }
 
@@ -473,7 +498,15 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        // switch to process-specific kernel page table
+        w_satp(MAKE_SATP(p->kernelpgtbl));
+        sfence_vma();
+        
         swtch(&c->context, &p->context);
+
+        // switch kernel page table back to the globally shared kernel_pagetable
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
