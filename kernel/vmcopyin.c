@@ -30,7 +30,7 @@ int
 copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
   struct proc *p = myproc();
-
+  // printf("trace: copyin_new %p, %p, %p, %d\n", r_satp(), dst, srcva, len);
   if (srcva >= p->sz || srcva+len >= p->sz || srcva+len < srcva)
     return -1;
   memmove((void *) dst, (void *)srcva, len);
@@ -45,6 +45,7 @@ copyin_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr_new(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
+  // printf("trace: copyinstr_new %p, %p, %p, %d\n", r_satp(), dst, srcva, max);
   struct proc *p = myproc();
   char *s = (char *) srcva;
   

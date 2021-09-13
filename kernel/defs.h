@@ -165,6 +165,8 @@ uint64          kvmpa(pagetable_t, uint64);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 // void *kget_freelist(void); // used for tracing purposes in exp2
 void			kvm_free_kernelpgtbl(pagetable_t);
+int 			kvmcopymappings(pagetable_t src, pagetable_t dst, uint64 start, uint64 sz);
+uint64 			kvmdealloc(pagetable_t kernelpgtbl, uint64 oldsz, uint64 newsz);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 void            uvminit(pagetable_t, uchar *, uint);
