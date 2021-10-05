@@ -14,6 +14,7 @@ struct entry {
   struct entry *next;
 };
 struct entry *table[NBUCKET];
+pthread_mutex_t locks[NBUCKET];
 int keys[NKEYS];
 int nthread = 1;
 
@@ -24,8 +25,6 @@ now()
  gettimeofday(&tv, 0);
  return tv.tv_sec + tv.tv_usec / 1000000.0;
 }
-
-pthread_mutex_t lock;
 
 static void 
 insert(int key, int value, struct entry **p, struct entry *n)
@@ -42,7 +41,7 @@ void put(int key, int value)
 {
   int i = key % NBUCKET;
 
-  pthread_mutex_lock(&lock);
+  pthread_mutex_lock(&locks[i]);
   // is the key already present?
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
@@ -56,7 +55,7 @@ void put(int key, int value)
     // the new is new.
     insert(key, value, &table[i], table[i]);
   }
-  pthread_mutex_unlock(&lock);
+  pthread_mutex_unlock(&locks[i]);
 }
 
 static struct entry*
@@ -64,12 +63,12 @@ get(int key)
 {
   int i = key % NBUCKET;
 
-  pthread_mutex_lock(&lock);
+  pthread_mutex_lock(&locks[i]);
   struct entry *e = 0;
   for (e = table[i]; e != 0; e = e->next) {
     if (e->key == key) break;
   }
-  pthread_mutex_unlock(&lock);
+  pthread_mutex_unlock(&locks[i]);
 
   return e;
 }
@@ -120,7 +119,9 @@ main(int argc, char *argv[])
     keys[i] = random();
   }
   
-  pthread_mutex_init(&lock, NULL);
+  for(int i=0;i<NBUCKET;i++) {
+    pthread_mutex_init(&locks[i], NULL); 
+  }
 
   //
   // first the puts
