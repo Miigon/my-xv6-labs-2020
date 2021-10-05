@@ -1,0 +1,14 @@
+[bucket for key k1, k2 does not exist initially.]
+
+suppose k1 and k2 falls into the same bucket
+
+thread 1: puts k1
+thread 1: find out that key k1 does not exist, trying to insert entry k1
+--- scheduler switched to thread 2
+thread 2: puts k2
+thread 2: finds out that key k2 does not exist, trying to insert entry k2 (at the same spot as k1)
+thread 2: allocates entry, inserts k2 into the bucket
+--- scheduler switched back to thread 1
+thread 1: allocates entry, inserts k1, overwrites k2 created by thread 2
+
+[k1 exists, but k2 is missing]
