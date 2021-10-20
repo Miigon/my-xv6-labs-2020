@@ -70,7 +70,7 @@ bget(uint dev, uint blockno)
 
   // printf("dev: %d, blockno: %d, locked: %d\n", dev, blockno, bcache.bufmap_locks[key].locked);
   
-  acquire(&bcache.bufmap_locks[key]); // can not acquire another bucket's lock before releasing this lock (potential deadlock)
+  acquire(&bcache.bufmap_locks[key]);
 
   // Is the block already cached?
   for(b = bcache.bufmap[key].next; b; b = b->next){
@@ -86,21 +86,31 @@ bget(uint dev, uint blockno)
 
   // to get a suitable block to reuse, we need to search for one in all the buckets,
   // which means acquiring their bucket locks.
-  // but it's not safe to acquire another bucket lock while holding one.
+  // but it's not safe to try to acquire every single bucket lock while holding one.
   // it can easily lead to circular wait, which produces deadlock.
 
   release(&bcache.bufmap_locks[key]);
-  // we need to release our bucket lock   
-  // another cpu might request the same block here and a cache buf for the block 
-  // might already exist before acquiring bcache lock. so we have to check if the
-  // block is already cached one more time after acquiring the bcache lock
-  // (effectively, using optimisitic locking to protect this short moment in which we don't hold any spinlocks)
+  // we need to release our bucket lock so that iterating through all the buckets won't
+  // lead to circular wait and deadlock. however, as a side effect of releasing our bucket
+  // lock, other cpus might request the same blockno at the same time and the cache buf for  
+  // blockno might be created multiple times in the worst case. since multiple concurrent
+  // bget requests might pass the "Is the block already cached?" test and start the 
+  // eviction & reuse process multiple times for the same blockno.
+  //
+  // so, after acquiring eviction_lock, we check "whether cache for blockno is present"
+  // once more, to be sure that we don't create duplicate cache bufs.
   acquire(&bcache.eviction_lock);
 
   // Check again, is the block already cached?
+  // no other eviction & reuse will happen while we are holding eviction_lock,
+  // which means no link list structure of any bucket can change.
+  // so it's ok here to iterate through `bcache.bufmap[key]` without holding
+  // it's cooresponding bucket lock, since we are holding a much stronger eviction_lock.
   for(b = bcache.bufmap[key].next; b; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
+      acquire(&bcache.bufmap_locks[key]); // must do, for `refcnt++`
       b->refcnt++;
+      release(&bcache.bufmap_locks[key]);
       release(&bcache.eviction_lock);
       acquiresleep(&b->lock);
       return b;
@@ -108,7 +118,7 @@ bget(uint dev, uint blockno)
   }
 
   // Still not cached.
-  // we are now only holding bcache lock, and none of the bucket locks are held by us.
+  // we are now only holding eviction lock, none of the bucket locks are held by us.
   // so it's now safe to acquire any bucket's lock without risking circular wait and deadlock.
 
   // find the one least-recently-used buf among all buckets.
@@ -184,7 +194,6 @@ bwrite(struct buf *b)
 }
 
 // Release a locked buffer.
-// Move to the head of the most-recently-used list.
 void
 brelse(struct buf *b)
 {
@@ -193,15 +202,11 @@ brelse(struct buf *b)
 
   releasesleep(&b->lock);
 
-  
   uint key = BUFMAP_HASH(b->dev, b->blockno);
 
-  // Use bucket lock to protect b->refcnt, instead of bcache.lock
-  // bcache.lock is used as lock for the global LRU list instead.
   acquire(&bcache.bufmap_locks[key]);
   b->refcnt--;
   if (b->refcnt == 0) {
-    // no one is waiting for it.
     b->lastuse = ticks;
   }
   release(&bcache.bufmap_locks[key]);
