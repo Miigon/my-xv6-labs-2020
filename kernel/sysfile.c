@@ -513,7 +513,6 @@ sys_mmap(void)
   // from high addresses to low addresses.
 
   // Find a free vma, and calculate where to map the file along the way.
-  acquire(&p->lock);
   for(int i=0;i<NVMA;i++) {
     struct vma *vv = &p->vmas[i];
     if(vv->valid == 0) {
@@ -526,7 +525,6 @@ sys_mmap(void)
       vaend = PGROUNDDOWN(vv->vastart);
     }
   }
-  release(&p->lock);
 
   if(v == 0){
     panic("mmap: no free vma");
