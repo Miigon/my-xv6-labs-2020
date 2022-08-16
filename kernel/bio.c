@@ -28,7 +28,7 @@
 
 struct {
   struct buf buf[NBUF];
-  struct spinlock eviction_lock;
+  struct spinlock eviction_locks[NBUFMAP_BUCKET];
 
   // Hash map: dev and blockno to buf
   struct buf bufmap[NBUFMAP_BUCKET];
@@ -40,6 +40,7 @@ binit(void)
 {
   // Initialize bufmap
   for(int i=0;i<NBUFMAP_BUCKET;i++) {
+    initlock(&bcache.eviction_locks[i], "bcache_eviction");
     initlock(&bcache.bufmap_locks[i], "bcache_bufmap");
     bcache.bufmap[i].next = 0;
   }
@@ -54,8 +55,6 @@ binit(void)
     b->next = bcache.bufmap[0].next;
     bcache.bufmap[0].next = b;
   }
-
-  initlock(&bcache.eviction_lock, "bcache_eviction");
 }
 
 // Look through buffer cache for block on device dev.
@@ -97,21 +96,27 @@ bget(uint dev, uint blockno)
   // bget requests might pass the "Is the block already cached?" test and start the 
   // eviction & reuse process multiple times for the same blockno.
   //
-  // so, after acquiring eviction_lock, we check "whether cache for blockno is present"
+  // so, after acquiring eviction_locks[key], we check "whether cache for blockno is present"
   // once more, to be sure that we don't create duplicate cache bufs.
-  acquire(&bcache.eviction_lock);
+  //
+  // thanks @ttzytt for pointing out that eviction_lock really just need to be per-bucket instead
+  // of globally shared.
+  
+  // block any other thread from starting a concurrent eviction for this bucket
+  // (prevent duplicate buf for the same blockno)
+  acquire(&bcache.eviction_locks[key]);
 
   // Check again, is the block already cached?
-  // no other eviction & reuse will happen while we are holding eviction_lock,
-  // which means no link list structure of any bucket can change.
+  // no other allocation targeting this bucket will happen while we are holding eviction_locks[key],
+  // which means this bucket's linked list structure can not change.
   // so it's ok here to iterate through `bcache.bufmap[key]` without holding
-  // it's cooresponding bucket lock, since we are holding a much stronger eviction_lock.
+  // it's cooresponding bucket lock, since we are holding a much stronger eviction_locks[key].
   for(b = bcache.bufmap[key].next; b; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
       acquire(&bcache.bufmap_locks[key]); // must do, for `refcnt++`
       b->refcnt++;
       release(&bcache.bufmap_locks[key]);
-      release(&bcache.eviction_lock);
+      release(&bcache.eviction_locks[key]);
       acquiresleep(&b->lock);
       return b;
     }
@@ -165,7 +170,7 @@ bget(uint dev, uint blockno)
   b->refcnt = 1;
   b->valid = 0;
   release(&bcache.bufmap_locks[key]);
-  release(&bcache.eviction_lock);
+  release(&bcache.eviction_locks[key]);
   acquiresleep(&b->lock);
   return b;
 }
