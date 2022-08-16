@@ -28,12 +28,18 @@
 
 struct {
   struct buf buf[NBUF];
-  struct spinlock eviction_lock;
 
   // Hash map: dev and blockno to buf
   struct buf bufmap[NBUFMAP_BUCKET];
   struct spinlock bufmap_locks[NBUFMAP_BUCKET];
 } bcache;
+
+
+static inline void
+bbufmap_insertbucket(uint key, struct buf *b) {
+  b->next = bcache.bufmap[key].next;
+  bcache.bufmap[key].next = b;
+}
 
 void
 binit(void)
@@ -41,6 +47,7 @@ binit(void)
   // Initialize bufmap
   for(int i=0;i<NBUFMAP_BUCKET;i++) {
     initlock(&bcache.bufmap_locks[i], "bcache_bufmap");
+    // throws away the first buf in linked list, to make our lives easier
     bcache.bufmap[i].next = 0;
   }
 
@@ -48,14 +55,27 @@ binit(void)
   for(int i=0;i<NBUF;i++){
     struct buf *b = &bcache.buf[i];
     initsleeplock(&b->lock, "buffer");
+    b->valid = 0;
+    b->trash = 1; // need to be evicted and re-hashed before use.
     b->lastuse = 0;
     b->refcnt = 0;
-    // put all the buffers into bufmap[0]
-    b->next = bcache.bufmap[0].next;
-    bcache.bufmap[0].next = b;
+    // spread all the buffers among bufmap buckets evenly.
+    bbufmap_insertbucket(i%NBUFMAP_BUCKET, b);
   }
+}
 
-  initlock(&bcache.eviction_lock, "bcache_eviction");
+// Try to look for block on device dev inside a specific bufmap bucket.
+// If found, return buffer. Otherwise return null.
+// Must already be holding bufmap_lock[key] for this to be thread-safe
+static inline struct buf*
+bbufmap_searchbucket(uint key, uint dev, uint blockno) {
+  struct buf *b;
+  for(b = bcache.bufmap[key].next; b; b = b->next){
+    if(b->dev == dev && b->blockno == blockno && !b->trash){
+      return b;
+    }
+  }
+  return 0;
 }
 
 // Look through buffer cache for block on device dev.
@@ -73,14 +93,13 @@ bget(uint dev, uint blockno)
   acquire(&bcache.bufmap_locks[key]);
 
   // Is the block already cached?
-  for(b = bcache.bufmap[key].next; b; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.bufmap_locks[key]);
-      acquiresleep(&b->lock);
-      return b;
-    }
+  if((b = bbufmap_searchbucket(key, dev, blockno))) {
+    b->refcnt++;
+    release(&bcache.bufmap_locks[key]);
+    acquiresleep(&b->lock);
+    return b;
   }
+  
 
   // Not cached.
 
@@ -95,31 +114,12 @@ bget(uint dev, uint blockno)
   // lock, other cpus might request the same blockno at the same time and the cache buf for  
   // blockno might be created multiple times in the worst case. since multiple concurrent
   // bget requests might pass the "Is the block already cached?" test and start the 
-  // eviction & reuse process multiple times for the same blockno.
-  //
-  // so, after acquiring eviction_lock, we check "whether cache for blockno is present"
-  // once more, to be sure that we don't create duplicate cache bufs.
-  acquire(&bcache.eviction_lock);
+  // eviction & reuse process concurrently for the same blockno.
 
-  // Check again, is the block already cached?
-  // no other eviction & reuse will happen while we are holding eviction_lock,
-  // which means no link list structure of any bucket can change.
-  // so it's ok here to iterate through `bcache.bufmap[key]` without holding
-  // it's cooresponding bucket lock, since we are holding a much stronger eviction_lock.
-  for(b = bcache.bufmap[key].next; b; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      acquire(&bcache.bufmap_locks[key]); // must do, for `refcnt++`
-      b->refcnt++;
-      release(&bcache.bufmap_locks[key]);
-      release(&bcache.eviction_lock);
-      acquiresleep(&b->lock);
-      return b;
-    }
-  }
-
-  // Still not cached.
-  // we are now only holding eviction lock, none of the bucket locks are held by us.
-  // so it's now safe to acquire any bucket's lock without risking circular wait and deadlock.
+  // ====== eviction process ======
+  // the eviction process consists of two phases:
+  // 1. stealing: search for an available buf in all buckets, steal(evict) it for our new block to use.
+  // 2. inserting: insert the newly evicted buf into blockno's bucket.
 
   // find the one least-recently-used buf among all buckets.
   // finish with it's corresponding bucket's lock held.
@@ -132,7 +132,7 @@ bget(uint dev, uint blockno)
     acquire(&bcache.bufmap_locks[i]);
     int newfound = 0; // new least-recently-used buf found in this bucket
     for(b = &bcache.bufmap[i]; b->next; b = b->next) {
-      if(b->next->refcnt == 0 && (!before_least || b->next->lastuse < before_least->next->lastuse)) {
+      if((b->trash || b->next->refcnt == 0) && (!before_least || b->next->lastuse < before_least->next->lastuse)) {
         before_least = b;
         newfound = 1;
       }
@@ -148,26 +148,64 @@ bget(uint dev, uint blockno)
   if(!before_least) {
     panic("bget: no buffers");
   }
-  b = before_least->next;
+  struct buf *newb;
+  newb = before_least->next;
   
   if(holding_bucket != key) {
     // remove the buf from it's original bucket
-    before_least->next = b->next;
+    before_least->next = newb->next;
     release(&bcache.bufmap_locks[holding_bucket]);
-    // rehash and add it to the correct bucket
+
+    // reacquire blockno's bucket lock, for later insertion
     acquire(&bcache.bufmap_locks[key]);
-    b->next = bcache.bufmap[key].next;
-    bcache.bufmap[key].next = b;
   }
+
+  // stealing phase end, inserting phase start
+
+  // we have to check again: is this blockno now cached by another process?
+  // we need to do this because during the stealing phase we don't hold
+  // the bucket lock for bufmap[key] to prevent circular wait, but this can
+  // lead to duplicate concurrent cache allocation for blockno. 
+  if((b = bbufmap_searchbucket(key, dev, blockno))){
+    b->refcnt++;
+
+    if(holding_bucket != key) {
+      // still insert newb into bufmap[key], but as a trash buffer.
+      // (do not return to original bucket, to prevent deadlock)
+      // trash buffers will not be accessed before being evicted and re-hashed (untrashed)
+      newb->trash = 1;
+      newb->lastuse = 0; // so it will be evicted and re-used earlier.
+
+      bbufmap_insertbucket(key, newb);
+    } else {
+      // don't need to trash it because we havn't removed it from it's original bucket
+      // and havn't done anything to alter it in any way.
+    }
+
+    release(&bcache.bufmap_locks[key]);
+    acquiresleep(&b->lock);
+    return b;
+  }
+
+  // still doesn't exist, now insert newb into `bcache.bufmap[key]`
+
+  if(holding_bucket != key) {
+    // should already be holding &bcache.bufmap_locks[key]
+    
+    // rehash and add it to the correct bucket
+    bbufmap_insertbucket(key, newb);
+  }
+
+  // configure newb and return
   
-  b->dev = dev;
-  b->blockno = blockno;
-  b->refcnt = 1;
-  b->valid = 0;
+  newb->trash = 0; // untrash
+  newb->dev = dev;
+  newb->blockno = blockno;
+  newb->refcnt = 1;
+  newb->valid = 0;
   release(&bcache.bufmap_locks[key]);
-  release(&bcache.eviction_lock);
-  acquiresleep(&b->lock);
-  return b;
+  acquiresleep(&newb->lock);
+  return newb;
 }
 
 // Return a locked buf with the contents of the indicated block.
