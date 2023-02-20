@@ -321,16 +321,24 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
-    // clear out PTE_W for parent, set PTE_COW
-    *pte = (*pte & ~PTE_W) | PTE_COW;
+    if(*pte & PTE_W) {
+      // clear out PTE_W for parent, set PTE_COW
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
     // map physical page of parent directly to child (copy-on-write)
     // since the write flag has already been cleared for the parent
     // the child mapping won't have the write flag as well.
+    //
+    // for page that is already read-only for parent, it will be read-
+    // only for child as well.
+    // for read-only page that is also a cow page, the PTE_COW flag will
+    // be copied over to child page, making it a cow page automatically.
     if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
-    // increase reference count of the page by one (for the child)
+    // for any cases above, we created a new reference to the physical
+    // page, so increase reference count by one.
     krefpage((void*)pa);
   }
   return 0;
@@ -361,10 +369,9 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
 
-  if(uvmcheckcowpage(dstva))
-    uvmcowcopy(dstva);
-
   while(len > 0){
+    if(uvmcheckcowpage(dstva))
+      uvmcowcopy(dstva);
     va0 = PGROUNDDOWN(dstva);
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
