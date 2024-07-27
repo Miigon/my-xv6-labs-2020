@@ -20,7 +20,7 @@ extern char trampoline[]; // trampoline.S
 
 void kvm_map_pagetable(pagetable_t pgtbl) {
   // 将各种内核需要的 direct mapping 添加到页表 pgtbl 中
-  
+  // 傻逼
   // uart registers
   kvmmap(pgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
 
