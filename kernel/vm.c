@@ -7,7 +7,6 @@
 #include "fs.h"
 #include "spinlock.h"
 #include "proc.h"
-// 哈哈
 
 /*
  * the kernel's page table.
